@@ -7,7 +7,7 @@
     Version: 1.1
 
     Description:
-    This script processes VCF files for ancestral allele polarization. Copilot refined the annotation and format. It references Ari pipeline # slightly modified code from https://www.biostars.org/p/173338/
+    This script processes VCF files for ancestral allele polarization. Copilot refined the code and format. It references Ari pipeline # slightly modified code from https://www.biostars.org/p/173338/
     cat > biostars_173338 << 'EOF'
     while(<>) {
         if(/^#/) {
