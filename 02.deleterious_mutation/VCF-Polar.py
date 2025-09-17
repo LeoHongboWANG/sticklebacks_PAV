@@ -73,427 +73,308 @@ import tempfile
 from typing import List, Optional, Dict, Set, Tuple
 from tqdm import tqdm
 
-# what's happening
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# not good but it works
-ancestral_sample_indices = []
-consensus_thresh = 0.8
+anc_sample_indices = []
+cons_threshold = 0.8
 
-def setup_worker_globals(anc_indices_arg, threshold_arg):
-    """Set up global variably for worker processes."""
-    global ancestral_sample_indices, consensus_thresh
-    ancestral_sample_indices = anc_indices_arg
-    consensus_thresh = threshold_arg
+def init_globals(anc_indices_arg, threshold_arg):
+    global anc_sample_indices, cons_threshold
+    anc_sample_indices = anc_indices_arg
+    cons_threshold = threshold_arg
 
-def check_vcf_line_format(fields: List[str]) -> bool:
-    """Make sure we have enough columns in the VCF line."""
-    min_cols = 8  # VCF spec requires at least 8 columns
-    return len(fields) >= min_cols
+def validate_vcf_fields(fields: List[str]) -> bool:
+    required_columns = 8
+    return len(fields) >= required_columns
 
-def flip_allele_frequency(info_field: str) -> str:
+def recalculate_af(info: str) -> str:
+    pattern = re.compile(r"(AF=)([0-9.eE+-]+)")
+    def repl(match):
+        af_val = float(match.group(2))
+        return f"{match.group(1)}{max(0, min(1, 1 - af_val)):.6g}"
+    return re.sub(pattern, repl, info)
 
-    af_pattern = re.compile(r"(AF=)([0-9.eE+-]+)")
+def recode_genotype(genotype_field: str) -> str:
+    if genotype_field in {"./.", ".|.", "."} or not genotype_field:
+        return genotype_field
     
-    def replace_af(match):
-        try:
-            original_af = float(match.group(2))
-            # Calculate 1 - AF, but keep it within [0,1] bounds
-            flipped_af = max(0, min(1, 1 - original_af))
-            return f"{match.group(1)}{flipped_af:.6g}"
-        except ValueError:
-            logging.warning(f"Couldn't parse AF value: {match.group(2)}")
-            return match.group(0)  # Return original if parsing fails
+    parts = genotype_field.split(":", 1)
+    g = parts[0]
     
-    return re.sub(af_pattern, replace_af, info_field)
-
-def swap_genotype_alleles(gt_field: str) -> str:
-    """
-    Swap genotype alleles: 0 becomes 1, 1 becomes 0.
-    Need to handle different separators and preserve other format fields.
-    """
-    # Handle missing data cases
-    if gt_field in {"./.", ".|.", "."} or not gt_field:
-        return gt_field
+    sep = "/" if "/" in g else "|" if "|" in g else None
     
-    try:
-        # Split genotype from other format fields (like DP, GQ, etc.)
-        format_parts = gt_field.split(":", 1)
-        genotype = format_parts[0]
-        
-        # Figure out what separator is being used
-        separator = None
-        if "/" in genotype:
-            separator = "/"
-        elif "|" in genotype:
-            separator = "|"
-        
-        if separator:
-            alleles = genotype.split(separator)
-            # Swap the alleles - only swap 0s and 1s, leave others alone
-            swapped_alleles = []
-            for allele in alleles:
-                if allele == "0":
-                    swapped_alleles.append("1")
-                elif allele == "1":
-                    swapped_alleles.append("0")
-                else:
-                    swapped_alleles.append(allele)  # Keep missing (.) or other values
-            
-            new_genotype = separator.join(swapped_alleles)
-            
-            # Put it back together with format fields
-            if len(format_parts) > 1:
-                return new_genotype + ":" + format_parts[1]
-            else:
-                return new_genotype
-        
-        # If no separator found, just return as-is
-        return gt_field
-        
-    except Exception as e:
-        logging.error(f"Problem swapping genotype {gt_field}: {e}")
-        return gt_field  # Return original on error
+    if sep:
+        alleles = g.split(sep)
+        swapped = [
+            ("1" if a == "0" else "0") if a in {"0", "1"} else a 
+            for a in alleles
+        ]
+        new_g = sep.join(swapped)
+        return new_g + (":" + parts[1] if len(parts) > 1 else "")
+    
+    return genotype_field
 
-def find_gt_position(format_str: str) -> Optional[int]:
-    """Find where GT is in the FORMAT field."""
-    if not format_str:
+def get_gt_indices(format_field: str) -> Optional[int]:
+    if not format_field:
         return None
     
-    format_fields = format_str.split(":")
-    for idx, field in enumerate(format_fields):
+    fields = format_field.split(":")
+    for i, field in enumerate(fields):
         if field == "GT":
-            return idx
+            return i
     
-    return None  # GT not found
+    return None
 
-def determine_ancestral_consensus(vcf_fields: List[str], ancestral_indices: List[int]) -> Optional[str]:
-    """
-    Figure out the ancestral allele from the specified samples.
-    We count homozygous REF and ALT calls and see if either meets our threshold.
-    """
-    ref_allele = vcf_fields[3]
-    alt_allele = vcf_fields[4]
+def compute_consensus(fields: List[str], anc_indices: List[int]) -> Optional[str]:
+    ref_allele = fields[3]
+    alt_allele = fields[4]
     
-    # Skip if this is a complex variant (multiple alts, non-ACGT bases)
     if "," in alt_allele or not re.match(r"^[ACGTacgt]+$", alt_allele):
         return None
     
-    # Counters for homozygous calls
-    ref_homo_count = 0
-    alt_homo_count = 0
-    total_informative = 0
+    ref_count = 0
+    alt_count = 0
+    total = 0
     
-    # Find GT position in FORMAT
-    format_field = vcf_fields[8] if len(vcf_fields) > 8 else ""
-    gt_position = find_gt_position(format_field)
+    format_field = fields[8] if len(fields) > 8 else ""
+    gt_idx = get_gt_indices(format_field)
     
-    if gt_position is None:
-        logging.debug("No GT field found in FORMAT")
+    if gt_idx is None:
+        logging.debug("FORMAT field does not contain GT")
         return None
     
-    # Check each ancestral sample
-    for sample_idx in ancestral_indices:
-        if sample_idx < len(vcf_fields):
-            sample_data = vcf_fields[sample_idx]
-            if not sample_data or sample_data == ".":
+    for idx in anc_indices:
+        if idx < len(fields):
+            genotype_field = fields[idx]
+            if not genotype_field or genotype_field == ".":
                 continue
                 
-            sample_fields = sample_data.split(":")
-            if len(sample_fields) <= gt_position:
+            genotype_parts = genotype_field.split(":")
+            if len(genotype_parts) <= gt_idx:
                 continue
                 
-            gt = sample_fields[gt_position]
+            genotype = genotype_parts[gt_idx]
             
-            # Determine separator
-            if "/" in gt:
+            if "/" in genotype:
                 sep = "/"
-            elif "|" in gt:
+            elif "|" in genotype:
                 sep = "|"
             else:
                 continue
                 
-            alleles = gt.split(sep)
+            alleles = genotype.split(sep)
             
-            # Skip if any allele is missing
             if any(a == "." for a in alleles):
                 continue
                 
-            # Only count homozygous calls for consensus
             if all(a == "0" for a in alleles):
-                ref_homo_count += 1
-                total_informative += 1
+                ref_count += 1
+                total += 1
             elif all(a == "1" for a in alleles):
-                alt_homo_count += 1
-                total_informative += 1
-            # Heterozygous calls don't contribute to consensus
+                alt_count += 1
+                total += 1
     
-    if total_informative == 0:
+    if total == 0:
         return None
         
-    # Check if either allele meets threshold
-    ref_proportion = ref_homo_count / total_informative
-    alt_proportion = alt_homo_count / total_informative
-    
-    if ref_proportion >= consensus_thresh:
+    if (ref_count / total) >= cons_threshold:
         return ref_allele
-    elif alt_proportion >= consensus_thresh:
+    elif (alt_count / total) >= cons_threshold:
         return alt_allele
     else:
         return None
 
-def add_aa_to_info(info_field: str, ancestral_allele: str) -> str:
-    """Add or update the AA field in INFO."""
-    # Remove any existing AA field first
-    info_field = re.sub(r";?AA=[^;]+", "", info_field)
+def update_info_with_aa(info: str, ancestral_allele: str) -> str:
+    info = re.sub(r";?AA=[^;]+", "", info)
     
-    # Add the new AA field
-    if not info_field:
+    if not info:
         return f"AA={ancestral_allele}"
     else:
-        return f"{info_field};AA={ancestral_allele}"
+        return f"{info};AA={ancestral_allele}"
 
-def process_vcf_line(line: str, mode: str, skip_without_consensus: bool = True) -> Optional[str]:
-    """
-    Process a single VCF line - this is where the magic happens.
-    We determine the ancestral allele and potentially swap REF/ALT.
-    """
+def recode_line(line: str, mode: str, skip_no_consensus: bool = True) -> Optional[str]:
     if line.startswith("#"):
         return line
 
-    try:
-        fields = line.strip().split("\t")
-        if not check_vcf_line_format(fields):
-            logging.warning(f"Malformed VCF line: {line}")
-            return None
-
-        ref_allele = fields[3]
-        alt_allele = fields[4]
-        info_field = fields[7]
-        
-        # Skip complex variants - too complicated to handle properly
-        if ("," in alt_allele or 
-            not re.match(r"^[ACGTacgt]+$", alt_allele) or 
-            not re.match(r"^[ACGTacgt]+$", ref_allele)):
-            logging.debug(f"Skipping complex variant at position {fields[0]}:{fields[1]}")
-            if not skip_without_consensus:
-                return line
-            return None
-
-        ancestral_allele = None
-        global ancestral_sample_indices
-        
-        # Try to get consensus from ancestral samples first
-        if ancestral_sample_indices:
-            ancestral_allele = determine_ancestral_consensus(fields, ancestral_sample_indices)
-            if ancestral_allele:
-                logging.debug(f"Got ancestral allele {ancestral_allele} from sample consensus")
-                
-                # Update INFO field with AA
-                info_field = add_aa_to_info(info_field, ancestral_allele)
-                fields[7] = info_field
-        
-        # Fallback to existing AA field in INFO
-        if not ancestral_allele:
-            aa_match = re.search(r"AA=([ACGTacgt]+)", info_field)
-            if aa_match:
-                ancestral_allele = aa_match.group(1).upper()
-                logging.debug(f"Using existing AA={ancestral_allele} from INFO")
-
-        # If we still don't have an ancestral allele, decide what to do
-        if not ancestral_allele:
-            logging.debug(f"No ancestral allele for {fields[0]}:{fields[1]}")
-            if skip_without_consensus:
-                return None
-            return line
-
-        # Check that ancestral allele is actually one of our alleles
-        if ancestral_allele not in {ref_allele, alt_allele}:
-            logging.debug(f"Ancestral allele {ancestral_allele} not in REF/ALT ({ref_allele}/{alt_allele})")
-            if skip_without_consensus:
-                return None
-            return line
-
-        # Decide if we need to swap based on the mode
-        need_swap = False
-        if mode == "ref":
-            need_swap = (ancestral_allele != ref_allele)
-        else:  # mode == "alt"
-            need_swap = (ancestral_allele != alt_allele)
-
-        if not need_swap:
-            # No swap needed, just return with updated INFO
-            return "\t".join(fields)
-        
-        # Time to swap REF and ALT
-        updated_info = flip_allele_frequency(info_field)
-        new_ref = alt_allele
-        new_alt = ref_allele
-        updated_fields = fields[:3] + [new_ref, new_alt] + fields[5:7] + [updated_info] + fields[8:]
-        
-        # Swap genotypes for all samples
-        if len(updated_fields) > 9:
-            updated_fields[9:] = [swap_genotype_alleles(gt) for gt in updated_fields[9:]]
-            
-        return "\t".join(updated_fields)
-    
-    except Exception as e:
-        logging.error(f"Error processing line: {line[:100]}... Error: {e}")
+    fields = line.strip().split("\t")
+    if not validate_vcf_fields(fields):
+        logging.warning(f"Invalid VCF line format: {line}")
         return None
 
-def process_line_chunk(chunk_num: int, lines: List[str], mode: str, skip_without_consensus: bool) -> List[Optional[str]]:
-    """Process a chunk of lines - used for parallel processing."""
+    ref, alt, info = fields[3], fields[4], fields[7]
+    
+    if "," in alt or not re.match(r"^[ACGTacgt]+$", alt) or not re.match(r"^[ACGTacgt]+$", ref):
+        logging.debug(f"Skipping complex variant: {line}")
+        if not skip_no_consensus:
+            return line
+        return None
+
+    consensus_allele = None
+    global anc_sample_indices
+    
+    if anc_sample_indices:
+        consensus_allele = compute_consensus(fields, anc_sample_indices)
+        if consensus_allele:
+            logging.debug(f"Consensus allele determined as {consensus_allele} from ancestral samples")
+            info = update_info_with_aa(info, consensus_allele)
+            fields[7] = info
+    
+    if not consensus_allele:
+        match = re.search(r"AA=([ACGTacgt]+)", info)
+        if match:
+            consensus_allele = match.group(1).upper()
+            logging.debug(f"Using AA={consensus_allele} from INFO field")
+
+    if not consensus_allele:
+        logging.debug(f"No ancestral allele found for position {fields[0]}:{fields[1]}")
+        if skip_no_consensus:
+            return None
+        return line
+
+    if consensus_allele not in {ref, alt}:
+        logging.debug(f"Ancestral allele {consensus_allele} not in REF/ALT ({ref}/{alt})")
+        if skip_no_consensus:
+            return None
+        return line
+
+    if mode == "ref":
+        swap = (consensus_allele != ref)
+    else:
+        swap = (consensus_allele != alt)
+
+    if not swap:
+        return "\t".join(fields)
+    
+    new_info = recalculate_af(info)
+    new_ref, new_alt = alt, ref
+    new_fields = fields[:3] + [new_ref, new_alt] + fields[5:7] + [new_info] + fields[8:]
+    
+    if len(new_fields) > 9:
+        new_fields[9:] = [recode_genotype(gt) for gt in new_fields[9:]]
+        
+    return "\t".join(new_fields)
+
+def process_chunk(chunk_id: int, lines: List[str], mode: str, skip_no_consensus: bool) -> List[Optional[str]]:
     results = []
     for line in lines:
-        result = process_vcf_line(line, mode, skip_without_consensus)
+        result = recode_line(line, mode, skip_no_consensus)
         if result is not None:
             results.append(result)
     
     return results
 
-def extract_chromosome_data(vcf_path: str, header_lines: List[str]) -> Dict[str, List[str]]:
-    """Pull out all the data organized by chromosome."""
-    chromosomes = {}
+def extract_chromosome_data(infile_path: str, header_lines: List[str]) -> Dict[str, List[str]]:
+    chroms = {}
     
-    # Figure out how to open the file
-    if vcf_path.endswith('.gz'):
-        file_opener = gzip.open
-        file_mode = 'rt'
-    else:
-        file_opener = open
-        file_mode = 'r'
+    open_func = gzip.open if infile_path.endswith('.gz') else open
+    mode = 'rt' if infile_path.endswith('.gz') else 'r'
     
-    with file_opener(vcf_path, file_mode) as f:
-        # Skip the header lines
-        for line in f:
+    with open_func(infile_path, mode) as infile:
+        for line in infile:
             if line.startswith('#'):
                 continue
             
-            # Process data lines
-            line_parts = line.strip().split('\t', 2)
-            if len(line_parts) >= 1:
-                chrom = line_parts[0]
-                if chrom not in chromosomes:
-                    chromosomes[chrom] = []
-                chromosomes[chrom].append(line.rstrip())
+            fields = line.strip().split('\t', 2)
+            if len(fields) >= 1:
+                chrom = fields[0]
+                if chrom not in chroms:
+                    chroms[chrom] = []
+                chroms[chrom].append(line.rstrip())
     
-    return chromosomes
+    return chroms
 
-def process_single_chromosome(chrom: str, lines: List[str], mode: str, anc_indices: List[int], 
-                             threshold: float, threads_per_chrom: int, skip_without_consensus: bool) -> str:
-    """Process all variants for one chromosome and save to temp file."""
-    # Create a temp file for this chromosome's results
-    fd, temp_file_path = tempfile.mkstemp(suffix=f"_{chrom}.vcf")
+def process_chrom_data(chrom: str, data_lines: List[str], mode: str, anc_indices: List[int], 
+                      threshold: float, threads_per_chrom: int, skip_no_consensus: bool) -> str:
+    fd, temp_path = tempfile.mkstemp(suffix=f"_{chrom}.vcf")
     os.close(fd)
     
-    # Figure out parallelization
-    num_threads = max(1, min(threads_per_chrom, len(lines) // 1000 + 1))
+    num_threads = max(1, min(threads_per_chrom, len(data_lines) // 1000 + 1))
     
-    # Set up the worker pool
     with multiprocessing.Pool(
         num_threads, 
-        initializer=setup_worker_globals, 
+        initializer=init_globals, 
         initargs=(anc_indices, threshold)
     ) as pool:
-        # Break lines into chunks
-        chunk_size = max(len(lines) // num_threads, 1000)
-        line_chunks = [(i, lines[i:i + chunk_size], mode, skip_without_consensus) 
-                      for i in range(0, len(lines), chunk_size)]
+        chunk_size = max(len(data_lines) // num_threads, 1000)
+        chunks = [(i, data_lines[i:i + chunk_size], mode, skip_no_consensus) 
+                  for i in range(0, len(data_lines), chunk_size)]
         
-        # Process the chunks
-        logging.info(f"Processing chromosome {chrom} using {num_threads} threads")
-        chunk_results = list(tqdm(
-            pool.starmap(process_line_chunk, line_chunks),
-            total=len(line_chunks),
+        logging.info(f"Processing chromosome {chrom} with {num_threads} threads")
+        results = list(tqdm(
+            pool.starmap(process_chunk, chunks),
+            total=len(chunks),
             unit="chunk",
-            desc=f"Chr {chrom}"
+            desc=f"Chrom {chrom}"
         ))
     
-    # Write all results to the temp file
-    with open(temp_file_path, 'w') as output:
-        for chunk_result in chunk_results:
-            for processed_line in chunk_result:
-                output.write(processed_line)
-                if not processed_line.endswith('\n'):
-                    output.write('\n')
+    with open(temp_path, 'w') as outfile:
+        for chunk_result in results:
+            for line in chunk_result:
+                outfile.write(line)
+                if not line.endswith('\n'):
+                    outfile.write('\n')
     
-    logging.info(f"Chromosome {chrom} done. Saved to {temp_file_path}")
-    return temp_file_path
+    logging.info(f"Chromosome {chrom} processing complete. Results in {temp_path}")
+    return temp_path
 
-def get_sample_column_indices(header_lines: List[str], sample_names: Set[str]) -> List[int]:
-    """Find which columns contain our samples of interest."""
+def find_sample_indices(header_lines: List[str], sample_names: Set[str]) -> List[int]:
     for line in header_lines:
         if line.startswith('#CHROM'):
-            columns = line.strip().split('\t')
-            if len(columns) > 9:
-                # Sample columns start at index 9
-                indices = []
-                for i, sample in enumerate(columns[9:], 9):
-                    if sample in sample_names:
-                        indices.append(i)
-                return indices
+            fields = line.strip().split('\t')
+            if len(fields) > 9:
+                return [i for i, sample in enumerate(fields[9:], 9) if sample in sample_names]
     return []
 
-def read_vcf_header(vcf_path: str) -> List[str]:
-    """Extract just the header lines from a VCF file."""
-    header = []
+def get_vcf_header(infile_path: str) -> List[str]:
+    header_lines = []
     
-    if vcf_path.endswith('.gz'):
-        file_opener = gzip.open
-        file_mode = 'rt'
-    else:
-        file_opener = open
-        file_mode = 'r'
+    open_func = gzip.open if infile_path.endswith('.gz') else open
+    mode = 'rt' if infile_path.endswith('.gz') else 'r'
     
-    with file_opener(vcf_path, file_mode) as f:
-        for line in f:
+    with open_func(infile_path, mode) as infile:
+        for line in infile:
             line = line.rstrip()
             if line.startswith('#'):
-                header.append(line)
+                header_lines.append(line)
             else:
-                break  # Stop at first data line
+                break
     
-    return header
+    return header_lines
 
-def make_sure_aa_header_exists(header_lines: List[str]) -> List[str]:
-    """Add AA header line if it's not already there."""
-    aa_info_line = '##INFO=<ID=AA,Number=1,Type=Character,Description="Ancestral allele">'
+def ensure_aa_header(header_lines: List[str]) -> List[str]:
+    aa_header = '##INFO=<ID=AA,Number=1,Type=Character,Description="Ancestral allele">'
     
-    # Check if we already have an AA header
     for line in header_lines:
         if line.startswith('##INFO=<ID=AA,') and 'Ancestral allele' in line:
-            return header_lines  # Already there, no need to add
+            return header_lines
     
-    # Find where to insert it
-    chrom_line_idx = -1
-    last_info_line_idx = -1
+    chrom_idx = -1
+    last_info_idx = -1
     
-    for idx, line in enumerate(header_lines):
+    for i, line in enumerate(header_lines):
         if line.startswith('#CHROM'):
-            chrom_line_idx = idx
+            chrom_idx = i
         elif line.startswith('##INFO='):
-            last_info_line_idx = idx
+            last_info_idx = i
     
-    # Insert after last INFO line, or before #CHROM line
-    if last_info_line_idx >= 0:
-        header_lines.insert(last_info_line_idx + 1, aa_info_line)
-    elif chrom_line_idx >= 0:
-        header_lines.insert(chrom_line_idx, aa_info_line)
+    if last_info_idx >= 0:
+        header_lines.insert(last_info_idx + 1, aa_header)
+    elif chrom_idx >= 0:
+        header_lines.insert(chrom_idx, aa_header)
     else:
-        # Fallback - just add at the end
-        header_lines.append(aa_info_line)
+        header_lines.append(aa_header)
     
     return header_lines
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VCF Recoder - polarize variants to ancestral alleles"
+        description="Advanced VCF Recoder for ancestral allele polarization"
     )
-    parser.add_argument("vcf", help="Input VCF file (can be gzipped)")
+    parser.add_argument("vcf", help="Input VCF file (supports .gz)")
     parser.add_argument(
         "-o", "--output", 
         help="Output VCF file (default: stdout)", 
@@ -503,19 +384,19 @@ def main():
         "--mode", 
         choices=["ref", "alt"], 
         default="ref",
-        help="Whether to make REF or ALT the ancestral allele"
+        help="'ref' makes REF=ancestral allele, 'alt' makes ALT=ancestral allele"
     )
     parser.add_argument(
         "--threads", 
         type=int, 
         default=max(1, multiprocessing.cpu_count() - 1),
-        help="Number of threads to use"
+        help="Number of threads (default: CPU cores - 1)"
     )
     parser.add_argument(
         "--log-level", 
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         default='INFO',
-        help="Logging verbosity"
+        help="Set logging level"
     )
     parser.add_argument(
         "--anc-list", 
@@ -526,200 +407,158 @@ def main():
         "--consensus-threshold", 
         type=float, 
         default=0.8, 
-        help="Minimum proportion for ancestral consensus"
+        help="Consensus threshold for ancestral allele determination (default: 0.8)"
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=100000,
-        help="Variants per batch when not processing by chromosome"
+        help="Number of variants to process in each batch (default: 100000)"
     )
     parser.add_argument(
         "--by-chrom",
         action="store_true",
-        help="Process chromosomes in parallel (good for big files)"
+        help="Process each chromosome in parallel (recommended for large files)"
     )
     parser.add_argument(
         "--tmp-dir",
-        help="Where to put temporary files",
+        help="Directory for temporary files (default: system temp dir)",
         default=None
     )
     parser.add_argument(
         "--keep-all",
         action="store_false",
         dest="skip_no_consensus",
-        help="Keep variants even without ancestral consensus"
+        help="Keep all variants even without ancestral consensus (default: skip)"
     )
     args = parser.parse_args()
 
-    # Set up logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     if not args.vcf:
-        logging.error("Need to specify an input VCF file")
+        logging.error("No input VCF specified")
         sys.exit(1)
     
-    # Set temp directory if user specified one
     if args.tmp_dir:
         if not os.path.exists(args.tmp_dir):
             os.makedirs(args.tmp_dir)
         tempfile.tempdir = args.tmp_dir
 
-    try:
-        # Open output - either stdout or a file
-        if args.output == "stdout":
-            output_file = sys.stdout
-        elif args.output.endswith(".gz"):
-            output_file = gzip.open(args.output, "wt")
-        else:
-            output_file = open(args.output, "w")
+    outfile = sys.stdout if args.output == "stdout" else (
+        gzip.open(args.output, "wt") if args.output.endswith(".gz") else open(args.output, "w")
+    )
+    
+    anc_samples_set = set()
+    if args.anc_list:
+        with open(args.anc_list, "r") as f:
+            anc_samples_set = {line.strip() for line in f if line.strip()}
+        logging.info(f"Loaded {len(anc_samples_set)} ancestral sample names from {args.anc_list}")
+    
+    header_lines = get_vcf_header(args.vcf)
+    if not header_lines:
+        logging.error("Failed to extract header from VCF")
+        sys.exit(1)
+    
+    header_lines = ensure_aa_header(header_lines)
+    logging.info("Ensured AA header is present in output VCF")
         
-        # Load ancestral sample names if we have them
-        ancestral_samples = set()
-        if args.anc_list:
-            with open(args.anc_list, "r") as f:
-                ancestral_samples = {line.strip() for line in f if line.strip()}
-            logging.info(f"Loaded {len(ancestral_samples)} ancestral sample names")
+    anc_sample_indices_local = find_sample_indices(header_lines, anc_samples_set)
+    if anc_samples_set and anc_sample_indices_local:
+        logging.info(f"Found {len(anc_sample_indices_local)} ancestral samples in VCF")
+    elif anc_samples_set:
+        logging.warning("No ancestral samples from list found in VCF")
         
-        # Read the VCF header
-        header_lines = read_vcf_header(args.vcf)
-        if not header_lines:
-            logging.error("Couldn't read VCF header")
-            sys.exit(1)
+    for header_line in header_lines:
+        outfile.write(header_line)
+        if not header_line.endswith('\n'):
+            outfile.write('\n')
+    
+    if args.by_chrom:
+        logging.info(f"Extracting data by chromosome from {args.vcf}")
+        chrom_data = extract_chromosome_data(args.vcf, header_lines)
+        logging.info(f"Found {len(chrom_data)} chromosomes in VCF")
         
-        # Make sure we have an AA header line
-        header_lines = make_sure_aa_header_exists(header_lines)
-        logging.info("AA header line added to output")
-            
-        # Find which columns have our ancestral samples
-        ancestral_sample_columns = get_sample_column_indices(header_lines, ancestral_samples)
-        if ancestral_samples and ancestral_sample_columns:
-            logging.info(f"Found {len(ancestral_sample_columns)} ancestral samples in the VCF")
-        elif ancestral_samples:
-            logging.warning("None of the ancestral samples were found in this VCF")
-            
-        # Write the header to output
-        for header_line in header_lines:
-            output_file.write(header_line)
-            if not header_line.endswith('\n'):
-                output_file.write('\n')
+        max_chroms = min(len(chrom_data), args.threads)
+        threads_per_chrom = max(1, args.threads // max_chroms)
         
-        if args.by_chrom:
-            # Chromosome-wise processing - better for really big files
-            logging.info(f"Reading data by chromosome from {args.vcf}")
-            chrom_data = extract_chromosome_data(args.vcf, header_lines)
-            logging.info(f"Found data for {len(chrom_data)} chromosomes")
+        with multiprocessing.Pool(max_chroms) as pool:
+            chrom_tasks = [
+                (chrom, data, args.mode, anc_sample_indices_local, args.consensus_threshold, 
+                 threads_per_chrom, args.skip_no_consensus)
+                for chrom, data in chrom_data.items()
+            ]
             
-            # Figure out how many threads to use per chromosome
-            max_parallel_chroms = min(len(chrom_data), args.threads)
-            threads_per_chrom = max(1, args.threads // max_parallel_chroms)
+            temp_files = list(tqdm(
+                pool.starmap(process_chrom_data, chrom_tasks),
+                total=len(chrom_tasks),
+                unit="chrom",
+                desc="Processing chromosomes"
+            ))
+        
+        logging.info(f"Combining results from {len(temp_files)} chromosomes")
+        for temp_file in temp_files:
+            with open(temp_file, 'r') as infile:
+                for line in infile:
+                    outfile.write(line)
             
-            # Process chromosomes in parallel
-            with multiprocessing.Pool(max_parallel_chroms) as pool:
-                chrom_processing_args = [
-                    (chrom, data, args.mode, ancestral_sample_columns, args.consensus_threshold, 
-                     threads_per_chrom, args.skip_no_consensus)
-                    for chrom, data in chrom_data.items()
-                ]
-                
-                temp_file_paths = list(tqdm(
-                    pool.starmap(process_single_chromosome, chrom_processing_args),
-                    total=len(chrom_processing_args),
-                    unit="chrom",
-                    desc="Processing chromosomes"
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+    
+    else:
+        logging.info("Processing VCF in sequential batches")
+        
+        def process_vcf_in_batches(infile_path: str, batch_size: int = 100000):
+            data_batch = []
+            
+            open_func = gzip.open if infile_path.endswith('.gz') else open
+            mode = 'rt' if infile_path.endswith('.gz') else 'r'
+            
+            with open_func(infile_path, mode) as infile:
+                for line in infile:
+                    line = line.rstrip()
+                    if line.startswith('#'):
+                        continue
+                    else:
+                        data_batch.append(line)
+                        if len(data_batch) >= batch_size:
+                            yield data_batch
+                            data_batch = []
+            
+            if data_batch:
+                yield data_batch
+        
+        for i, data_batch in enumerate(process_vcf_in_batches(args.vcf, args.batch_size)):
+            num_threads = max(1, min(args.threads, len(data_batch) // 1000 + 1))
+            logging.info(f"Processing batch {i+1} with {num_threads} threads ({len(data_batch)} variants)")
+            
+            chunk_size = max(len(data_batch) // num_threads, 1000)
+            chunks = [(i, data_batch[i:i + chunk_size], args.mode, args.skip_no_consensus) 
+                      for i in range(0, len(data_batch), chunk_size)]
+            
+            with multiprocessing.Pool(
+                num_threads, 
+                initializer=init_globals, 
+                initargs=(anc_sample_indices_local, args.consensus_threshold)
+            ) as pool:
+                results = list(tqdm(
+                    pool.starmap(process_chunk, chunks),
+                    total=len(chunks),
+                    unit="chunk",
+                    desc=f"Batch {i+1}"
                 ))
             
-            # Combine all the temp files into the final output
-            logging.info(f"Combining results from {len(temp_file_paths)} temp files")
-            for temp_path in temp_file_paths:
-                with open(temp_path, 'r') as temp_file:
-                    for line in temp_file:
-                        output_file.write(line)
-                
-                # Clean up the temp file
-                try:
-                    os.remove(temp_path)
-                except Exception as e:
-                    logging.warning(f"Couldn't remove temp file {temp_path}: {e}")
-        
-        else:
-            # Process the VCF in batches - simpler approach
-            logging.info("Processing VCF in batches")
+            for chunk_result in results:
+                for line in chunk_result:
+                    outfile.write(line)
+                    if not line.endswith('\n'):
+                        outfile.write('\n')
             
-            def read_vcf_in_batches(vcf_path: str, batch_size: int = 100000):
-                """Read VCF file in chunks to avoid memory issues."""
-                current_batch = []
-                
-                if vcf_path.endswith('.gz'):
-                    file_opener = gzip.open
-                    file_mode = 'rt'
-                else:
-                    file_opener = open
-                    file_mode = 'r'
-                
-                with file_opener(vcf_path, file_mode) as f:
-                    for line in f:
-                        line = line.rstrip()
-                        if line.startswith('#'):
-                            continue  # Skip header - already written
-                        else:
-                            current_batch.append(line)
-                            if len(current_batch) >= batch_size:
-                                yield current_batch
-                                current_batch = []
-                
-                # Don't forget the last batch
-                if current_batch:
-                    yield current_batch
-            
-            # Process each batch
-            batch_counter = 0
-            for batch_lines in read_vcf_in_batches(args.vcf, args.batch_size):
-                batch_counter += 1
-                
-                # Figure out threading for this batch
-                threads_for_batch = max(1, min(args.threads, len(batch_lines) // 1000 + 1))
-                logging.info(f"Processing batch {batch_counter} with {threads_for_batch} threads ({len(batch_lines)} variants)")
-                
-                chunk_size = max(len(batch_lines) // threads_for_batch, 1000)
-                batch_chunks = [(i, batch_lines[i:i + chunk_size], args.mode, args.skip_no_consensus) 
-                               for i in range(0, len(batch_lines), chunk_size)]
-                
-                # Process chunks in parallel
-                with multiprocessing.Pool(
-                    threads_for_batch, 
-                    initializer=setup_worker_globals, 
-                    initargs=(ancestral_sample_columns, args.consensus_threshold)
-                ) as pool:
-                    batch_results = list(tqdm(
-                        pool.starmap(process_line_chunk, batch_chunks),
-                        total=len(batch_chunks),
-                        unit="chunk",
-                        desc=f"Batch {batch_counter}"
-                    ))
-                
-                # Write this batch's results
-                for chunk_result in batch_results:
-                    for processed_line in chunk_result:
-                        output_file.write(processed_line)
-                        if not processed_line.endswith('\n'):
-                            output_file.write('\n')
-                
-                logging.info(f"Batch {batch_counter} complete")
-        
-        logging.info("All done!")
-        
-    except Exception as e:
-        logging.critical(f"Something went wrong: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        # Make sure we close the output file if it's not stdout
-        if 'output_file' in locals() and output_file is not sys.stdout:
-            output_file.close()
+            logging.info(f"Completed batch {i+1}")
+    
+    logging.info("VCF processing complete")
+    
+    if outfile is not sys.stdout:
+        outfile.close()
 
-if __name__ == '__main__':
-    main()
 if __name__ == '__main__':
     main()
