@@ -5,10 +5,10 @@ Selected scripts accompanying *Demography and selection shape gene loss in fresh
 | Script | Analysis |
 |---|---|
 | `scripts/ancestral_genes.py` | Infer ancestral presence using pooled outgroup presence >90%; optionally count individual gene losses. |
-| `scripts/repeatability.py` | Screen recurrent freshwater losses and permute ecotype labels. |
+| `scripts/repeatability.py` | Identify recurrent freshwater-biased absences and permute ecotype labels. |
 | `scripts/phylogenetic_model.R` | Fit the phylogenetic Poisson model of gene loss, NePi and ecotype. |
 
-The two Python scripts were reconstructed from the documented analysis rules; the R script is a portable version of the original model script. The historical permutation seed is unknown. Input datasets and the full analysis workflow are not included here.
+The Python scripts implement the documented analysis rules and were reconstructed for this repository. The R script adapts the original model script for use with local input paths. The historical permutation seed is unknown. This repository provides selected scripts; input datasets and the full workflow are outside its scope.
 
 ## Dependencies and usage
 
@@ -20,8 +20,8 @@ python scripts/repeatability.py --counts gene_loss_by_population_and_gene.csv --
 Rscript scripts/phylogenetic_model.R DATA_ROOT results/phylogenetic
 ```
 
-- Ancestral input: tab-separated binary matrix, first column GeneID, remaining columns outgroup samples. Optional individual counts require `--pav FULL_PAV.tsv --samples SAMPLE_TABLE.tsv`, with `SampleID` and `Population` in the sample table.
-- Repeatability input: long CSV with `GeneID`, `Population`, `EcotypeSimple` (`Marine`/`Freshwater`), `PopulationSize`, `AbsentCount`. Defaults exclude SWE-LUN, classify a population as absent at ≥50%, and require absence in ≥half of freshwater populations and ≤one marine population. Use `--keep-genes IDs.txt` to restrict the gene set.
+- Ancestral input is a tab-separated binary matrix with GeneID in the first column and outgroup samples in the remaining columns. To count losses by individual, supply `--pav FULL_PAV.tsv --samples SAMPLE_TABLE.tsv`, with `SampleID` and `Population` in the sample table.
+- Repeatability input: long CSV with `GeneID`, `Population`, `EcotypeSimple` (`Marine`/`Freshwater`), `PopulationSize`, `AbsentCount`. By default, SWE-LUN is excluded. A gene qualifies when at least 50% of individuals lack it in at least half of the freshwater populations and no more than one marine population. Use `--keep-genes IDs.txt` to restrict the gene set.
 - Model input: `DATA_ROOT/p_dis_2.nwk` and `DATA_ROOT/analysis_outputs/excov_depth_robustness/sample_losttxt_with_coverage.csv`; the CSV requires `SampleID`, `EcotypeSimple`, `NePi`, `LostTxt`. Four chains run in parallel. Add `--validate-only` to check input preparation without fitting the model.
 
-Retain the existing `02.deleterious_mutation/VCF-Polar.py` in the repository.
+The repository also contains `02.deleterious_mutation/VCF-Polar.py`.
