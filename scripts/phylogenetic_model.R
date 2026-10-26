@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# 正式跑：4 条链并行（每核一条）+ 收敛诊断 + 合并后验
+
 # Usage: Rscript scripts/phylogenetic_model.R data results/phylogenetic_model [--validate-only]
 suppressPackageStartupMessages({
   library(MCMCglmm); library(ape); library(coda); library(parallel)
