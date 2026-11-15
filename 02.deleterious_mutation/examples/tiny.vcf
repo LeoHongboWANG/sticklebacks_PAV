@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=10>
+##INFO=<ID=AA,Number=1,Type=String,Description="Existing ancestral allele">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description="Genotype quality">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	fish1	fish2	out1	out2
+chr1	1	.	A	G	60	PASS	AA=A	GT:DP:GQ	0/0:12:50	0/1:12:50	0/0:12:50	0/0:12:50
+chr1	2	.	A	G	60	PASS	AA=G	GT:DP:GQ	0|0:12:50	0/1:12:50	1/1:12:50	1/1:12:50
+chr1	3	.	A	G	60	PASS	AA=N	GT:DP:GQ	0/1:12:50	1/1:12:50	0/1:12:50	0/1:12:50
+chr1	4	.	A	G	60	PASS	AA=A	GT:DP:GQ	0/0:12:50	0/1:12:50	0/0:12:5	./.:.:.
+chr1	5	.	A	AT	60	PASS	AA=A	GT:DP:GQ	0/1:12:50	0/0:12:50	0/0:12:50	0/0:12:50
+chr1	6	.	C	G	60	PASS	AA=G	GT:DP:GQ	0/0:12:50	./1:12:50	1/1:12:50	1/1:12:50

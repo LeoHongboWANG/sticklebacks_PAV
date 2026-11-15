@@ -24,4 +24,24 @@ Rscript scripts/phylogenetic_model.R DATA_ROOT results/phylogenetic
 - Repeatability input: long CSV with `GeneID`, `Population`, `EcotypeSimple` (`Marine`/`Freshwater`), `PopulationSize`, `AbsentCount`. By default, SWE-LUN is excluded. A gene qualifies when at least 50% of individuals lack it in at least half of the freshwater populations and no more than one marine population. Use `--keep-genes IDs.txt` to restrict the gene set.
 - Model input: `DATA_ROOT/p_dis_2.nwk` and `DATA_ROOT/analysis_outputs/excov_depth_robustness/sample_losttxt_with_coverage.csv`; the CSV requires `SampleID`, `EcotypeSimple`, `NePi`, `LostTxt`. Four chains run in parallel. Add `--validate-only` to check input preparation without fitting the model.
 
-The repository also contains `02.deleterious_mutation/VCF-Polar.py`.
+## VCF-Polar: ancestral-allele annotation
+
+[VCF-Polar 2](02.deleterious_mutation/README.md) provides a streaming command-line
+tool for VCF/BCF ancestral-allele annotation, derived allele frequency and
+per-sample derived dosage. It accepts existing INFO/AA, outgroup samples or a
+reference-coordinate ancestral FASTA. The default preserves REF, ALT, GT and
+phasing, and retains unresolved sites with decision reasons.
+
+Install from the repository root and try the bundled example:
+
+```sh
+python -m pip install .
+vcf-polar 02.deleterious_mutation/examples/tiny.vcf \
+  --anc-list 02.deleterious_mutation/examples/outgroups.txt \
+  -o tiny.annotated.vcf.gz --index --report tiny.summary.json
+```
+
+The original `02.deleterious_mutation/VCF-Polar.py` entry point remains available.
+Version 2 changes the defaults and the outgroup consensus rule; see the
+[migration notes](02.deleterious_mutation/README.md#migration-from-v11) and the
+linked immutable v1.1 source when reproducing the original analysis.
