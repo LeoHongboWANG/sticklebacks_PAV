@@ -1,0 +1,32 @@
+name: VCF-Polar tests
+on:
+  push:
+    paths:
+      - "vcf_polar.py"
+      - "02.deleterious_mutation/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".github/workflows/vcf-polar.yml"
+  pull_request:
+    paths:
+      - "vcf_polar.py"
+      - "02.deleterious_mutation/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - ".github/workflows/vcf-polar.yml"
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install ".[test]"
+      - run: python -m pytest -q
+      - run: vcf-polar --version
